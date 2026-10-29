@@ -153,64 +153,265 @@ class PlateInfo:
         self.small_image = small_img
 
         self.lines = gcode_text.splitlines()
-        self._parse_metrics()
         self._parse_boundaries()
+        self._parse_metrics()
+
+    def _parse_boundaries(self):
+        fname = os.path.basename(self.source_file)
+        plate_id = f"[{fname} (Plate {self.plate_index})]"
+
+        self.exec_start_idx = None
+        self.machine_start_idx = None
+        self.machine_start_end_idx = None
+        self.first_change_layer_idx = None
+        self.last_change_layer_idx = None
+        self.machine_end_start_idx = None
+        self.cali_test_idx = None
+
+        total_lines = len(self.lines)
+
+        # 1. Locate ; EXECUTABLE_BLOCK_START
+        for i, line in enumerate(self.lines):
+            stripped = line.strip()
+            if stripped == '; EXECUTABLE_BLOCK_START':
+                self.exec_start_idx = i
+                break
+
+        if self.exec_start_idx is None:
+            raise ValueError(f"{plate_id} Missing required marker '; EXECUTABLE_BLOCK_START'. Refusing to merge.")
+
+        # 2. Locate layer changes (first and last ; CHANGE_LAYER)
+        for i in range(self.exec_start_idx + 1, total_lines):
+            stripped = self.lines[i].strip()
+            if stripped == '; CHANGE_LAYER':
+                if self.first_change_layer_idx is None:
+                    self.first_change_layer_idx = i
+                self.last_change_layer_idx = i
+
+        if self.first_change_layer_idx is None:
+            raise ValueError(f"{plate_id} Missing required layer change marker '; CHANGE_LAYER'. Refusing to merge.")
+
+        # 3. Locate extrude cali test (for priming line extraction)
+        for i in range(self.exec_start_idx + 1, self.first_change_layer_idx):
+            line = self.lines[i]
+            if re.search(r';\s*={2,}\s*extrude cali test\b', line, re.IGNORECASE) or ';===== extrude cali test' in line:
+                self.cali_test_idx = i
+                break
+
+        # 4. Locate Machine Start G-Code boundaries
+        # Start of machine start gcode:
+        for i in range(self.exec_start_idx + 1, self.first_change_layer_idx):
+            stripped = self.lines[i].strip()
+            if stripped == '; MACHINE_START_GCODE_START':
+                self.machine_start_idx = i
+                break
+            if self.machine_start_idx is None:
+                if stripped == '; FEATURE: Custom' or stripped.startswith(';===== machine:'):
+                    self.machine_start_idx = i
+
+        if self.machine_start_idx is None:
+            for i in range(self.exec_start_idx + 1, self.first_change_layer_idx):
+                stripped = self.lines[i].strip()
+                if stripped.startswith('M1002') or stripped.startswith('G28') or stripped.startswith('M140') or stripped.startswith('M104'):
+                    self.machine_start_idx = i
+                    break
+
+        # End of machine start gcode:
+        for i in range(self.exec_start_idx + 1, self.first_change_layer_idx):
+            stripped = self.lines[i].strip()
+            if stripped == '; MACHINE_START_GCODE_END':
+                self.machine_start_end_idx = i
+                break
+            if stripped == '; filament start gcode' and self.machine_start_end_idx is None:
+                self.machine_start_end_idx = i
+
+        if self.machine_start_end_idx is None:
+            self.machine_start_end_idx = self.first_change_layer_idx
+
+        # Validate that machine start gcode is present between exec_start_idx and first_change_layer_idx
+        if self.machine_start_idx is None or self.machine_start_idx >= self.first_change_layer_idx:
+            raise ValueError(f"{plate_id} Machine start G-code entry point not found between '; EXECUTABLE_BLOCK_START' and '; CHANGE_LAYER'. Refusing to merge.")
+
+        start_active_lines = [l.split(';', 1)[0].strip() for l in self.lines[self.exec_start_idx : self.first_change_layer_idx]]
+        has_homing_or_bambu = any(
+            any(sig in al for sig in ['M1002', 'G28', 'G29'])
+            for al in start_active_lines
+        )
+        has_bed_heat = any(
+            re.search(r'M1[49]0\s+S\d+', al)
+            for al in start_active_lines
+        )
+        has_hotend_heat = any(
+            re.search(r'M10[49]\s+S\d+', al)
+            for al in start_active_lines
+        )
+
+        if not (has_homing_or_bambu and has_bed_heat and has_hotend_heat):
+            missing = []
+            if not has_homing_or_bambu: missing.append("homing/machine start (G28/M1002/G29)")
+            if not has_bed_heat: missing.append("bed heating (M140/M190)")
+            if not has_hotend_heat: missing.append("hotend heating (M104/M109)")
+            raise ValueError(f"{plate_id} Machine start G-code is incomplete or invalid (missing: {', '.join(missing)}). Refusing to merge.")
+
+        # 5. Locate Machine End G-Code start
+        search_start = self.last_change_layer_idx if self.last_change_layer_idx is not None else self.first_change_layer_idx
+
+        # Priority 1: explicit ; MACHINE_END_GCODE_START
+        for i in range(search_start, total_lines):
+            if self.lines[i].strip() == '; MACHINE_END_GCODE_START':
+                self.machine_end_start_idx = i
+                break
+
+        # Priority 2: ; filament end gcode or ; FEATURE: Custom before filament end / date
+        if self.machine_end_start_idx is None:
+            for i in range(search_start, total_lines):
+                stripped = self.lines[i].strip()
+                if stripped == '; filament end gcode':
+                    # Check if preceded by ; FEATURE: Custom
+                    if i > search_start and self.lines[i - 1].strip() == '; FEATURE: Custom':
+                        self.machine_end_start_idx = i - 1
+                    else:
+                        self.machine_end_start_idx = i
+                    break
+                elif stripped == '; FEATURE: Custom' and any(
+                    'filament end gcode' in self.lines[j] or 'date:' in self.lines[j]
+                    for j in range(i + 1, min(i + 5, total_lines))
+                ):
+                    self.machine_end_start_idx = i
+                    break
+
+        # Priority 3: check config block for machine_end_gcode first line
+        if self.machine_end_start_idx is None:
+            end_config_first_line = None
+            for l in self.lines[:1000]:
+                if l.startswith('; machine_end_gcode ='):
+                    val = l.split('=', 1)[1].strip()
+                    val = val.encode('utf-8').decode('unicode_escape') if '\\n' in val else val
+                    for el in val.splitlines():
+                        el_s = el.strip()
+                        if el_s and not el_s.startswith(';'):
+                            end_config_first_line = el_s
+                            break
+                        elif el_s and el_s.startswith(';====='):
+                            end_config_first_line = el_s
+                            break
+                    break
+
+            if end_config_first_line:
+                for i in range(search_start, total_lines):
+                    if end_config_first_line in self.lines[i]:
+                        if i > search_start and self.lines[i - 1].strip() == '; FEATURE: Custom':
+                            self.machine_end_start_idx = i - 1
+                        else:
+                            self.machine_end_start_idx = i
+                        break
+
+        # Priority 4: look for turn off bed/nozzle and steppers sequence in the tail
+        if self.machine_end_start_idx is None:
+            for i in range(search_start, total_lines):
+                stripped = self.lines[i].strip()
+                if stripped.startswith('M140 S0') or stripped.startswith('G392 S0'):
+                    cand = i
+                    for j in range(i - 1, search_start, -1):
+                        sj = self.lines[j].strip()
+                        if sj == '; FEATURE: Custom' or sj == '; filament end gcode':
+                            cand = j
+                            break
+                        if 'stop printing object' in sj or sj.startswith('G1 ') or sj.startswith('G0 '):
+                            break
+                    self.machine_end_start_idx = cand
+                    break
+
+        # Validate Machine End G-Code
+        if self.machine_end_start_idx is None or self.machine_end_start_idx <= self.first_change_layer_idx:
+            raise ValueError(f"{plate_id} Machine end G-code sequence not found. Refusing to merge.")
+
+        end_active_lines = [l.split(';', 1)[0].strip() for l in self.lines[self.machine_end_start_idx:]]
+        has_bed_off = any(re.search(r'M140\s+S0(?:\.0*)?\b', al) for al in end_active_lines)
+        has_hotend_off = any(re.search(r'M104\s+S0(?:\.0*)?\b', al) for al in end_active_lines)
+        has_stepper_off = any(re.search(r'(?:M18|M84)\b', al) for al in end_active_lines)
+        has_exec_end = any(l.strip() == '; EXECUTABLE_BLOCK_END' for l in self.lines[self.machine_end_start_idx:])
+
+        if not (has_bed_off and has_hotend_off and has_stepper_off and has_exec_end):
+            missing = []
+            if not has_bed_off: missing.append("bed heater off (M140 S0)")
+            if not has_hotend_off: missing.append("hotend heater off (M104 S0)")
+            if not has_stepper_off: missing.append("steppers disable (M18/M84)")
+            if not has_exec_end: missing.append("; EXECUTABLE_BLOCK_END")
+            raise ValueError(
+                f"{plate_id} Machine end G-code sequence is incomplete or invalid (missing: {', '.join(missing)}). Refusing to merge."
+            )
 
     def _parse_metrics(self):
-        # Bed and nozzle temp defaults
-        self.bed_temp = 45
-        self.nozzle_temp = 220
+        fname = os.path.basename(self.source_file)
+        plate_id = f"[{fname} (Plate {self.plate_index})]"
 
-        # 1. Search machine start G-code for the exact emitted temperatures
-        lines = self.lines[:1200]
-        found_bed_in_gcode = False
-        found_nozzle_in_gcode = False
+        # 1. Search machine start G-code for bed and nozzle temperatures
+        self.bed_temp = None
+        self.nozzle_temp = None
 
-        for line in lines:
-            if line.strip() == '; MACHINE_START_GCODE_END':
-                break
-            # Emitted bed temp: e.g. 'M190 S45; ensure bed temp'
-            if 'ensure bed temp' in line or re.match(r'^\s*M190\s+S(\d+)', line):
-                m = re.search(r'M190\s+S(\d+)', line)
+        start_lines = self.lines[self.exec_start_idx : self.first_change_layer_idx]
+        for line in start_lines:
+            # Emitted bed temp: e.g. 'M140 S45' or 'M190 S45; ensure bed temp'
+            if self.bed_temp is None:
+                m = re.search(r'M1[49]0\s+S(\d+)', line)
                 if m and int(m.group(1)) > 0:
                     self.bed_temp = int(m.group(1))
-                    found_bed_in_gcode = True
+
             # Emitted nozzle initial temp: 'M104 S225 ; prepare to print' or 'M109 S225' in cali test
-            if ('prepare to print' in line or 'extrude cali test' in line) and not found_nozzle_in_gcode:
+            if self.nozzle_temp is None:
                 m = re.search(r'M10[49]\s+S(\d+)', line)
                 if m and int(m.group(1)) > 150:
                     self.nozzle_temp = int(m.group(1))
-                    found_nozzle_in_gcode = True
 
         # 2. Check config block comments at top of file
         bed_type = self.json_data.get('bed_type', '')
         bed_key = f'; {bed_type}_temp_initial_layer =' if bed_type else None
 
-        for line in self.lines[:600]:
-            if line.startswith('; nozzle_temperature_initial_layer ='):
+        for line in self.lines[:1000]:
+            if line.strip() == '; CONFIG_BLOCK_END':
+                break
+            if self.nozzle_temp is None and line.startswith('; nozzle_temperature_initial_layer ='):
                 m = re.search(r'=\s*(\d+)', line)
-                if m and int(m.group(1)) > 0:
+                if m and int(m.group(1)) > 150:
                     self.nozzle_temp = int(m.group(1))
-            elif bed_key and line.startswith(bed_key):
+            elif self.nozzle_temp is None and line.startswith('; first_layer_temperature ='):
                 m = re.search(r'=\s*(\d+)', line)
-                if m and int(m.group(1)) > 0:
-                    self.bed_temp = int(m.group(1))
-            elif not found_bed_in_gcode and line.startswith('; supertack_plate_temp_initial_layer ='):
-                m = re.search(r'=\s*(\d+)', line)
-                if m and int(m.group(1)) > 0:
-                    self.bed_temp = int(m.group(1))
+                if m and int(m.group(1)) > 150:
+                    self.nozzle_temp = int(m.group(1))
+            elif self.bed_temp is None:
+                if bed_key and line.startswith(bed_key):
+                    m = re.search(r'=\s*(\d+)', line)
+                    if m and int(m.group(1)) > 0:
+                        self.bed_temp = int(m.group(1))
+                elif line.startswith('; first_layer_bed_temperature ='):
+                    m = re.search(r'=\s*(\d+)', line)
+                    if m and int(m.group(1)) > 0:
+                        self.bed_temp = int(m.group(1))
+                elif line.startswith('; supertack_plate_temp_initial_layer =') or line.startswith('; textured_plate_temp_initial_layer ='):
+                    m = re.search(r'=\s*(\d+)', line)
+                    if m and int(m.group(1)) > 0:
+                        self.bed_temp = int(m.group(1))
+
+        if self.bed_temp is None or self.bed_temp <= 0:
+            raise ValueError(f"{plate_id} Could not determine valid bed temperature. Refusing to merge.")
+        if self.nozzle_temp is None or self.nozzle_temp <= 0:
+            raise ValueError(f"{plate_id} Could not determine valid nozzle temperature. Refusing to merge.")
 
         # Layer count
         self.layer_count = 0
-        m = re.search(r'; total layer number:\s*(\d+)', self.gcode_text)
+        m = re.search(r';\s*(?:total layer number|total_layer_count)\s*[:=]\s*(\d+)', self.gcode_text)
         if m:
             self.layer_count = int(m.group(1))
         else:
-            layer_matches = re.findall(r'; layer num/total_layer_count:\s*(\d+)/', self.gcode_text)
+            layer_matches = re.findall(r';\s*layer num/total_layer_count:\s*(\d+)/', self.gcode_text)
             if layer_matches:
                 self.layer_count = max(int(l) for l in layer_matches)
             else:
                 self.layer_count = self.gcode_text.count('; CHANGE_LAYER')
+
+        if self.layer_count <= 0:
+            raise ValueError(f"{plate_id} Could not determine valid layer count (> 0). Refusing to merge.")
 
         # Filament & timing metrics
         self.filament_length_mm = 0.0
@@ -220,31 +421,73 @@ class PlateInfo:
         self.printing_time_s = 0
         self.estimated_time_s = 0
 
-        m = re.search(r'; total filament length \[mm\]\s*:\s*([\d.]+)', self.gcode_text)
+        # Filament length: BambuStudio '; total filament length [mm] :', OrcaSlicer '; filament used [mm] ='
+        m = re.search(r';\s*(?:total filament length \[mm\]\s*:|filament used \[mm\]\s*=)\s*([\d.]+)', self.gcode_text)
         if m:
             self.filament_length_mm = float(m.group(1))
-        m = re.search(r'; total filament volume \[cm\^3\]\s*:\s*([\d.]+)', self.gcode_text)
+
+        # Filament volume
+        m = re.search(r';\s*(?:total filament volume \[cm\^?3\]\s*:|filament used \[cm\^?3\]\s*=)\s*([\d.]+)', self.gcode_text)
         if m:
             self.filament_volume_cm3 = float(m.group(1))
-        m = re.search(r'; total filament weight \[g\]\s*:\s*([\d.]+)', self.gcode_text)
+
+        # Filament weight
+        m = re.search(r';\s*(?:total filament weight \[g\]\s*:|filament used \[g\]\s*=)\s*([\d.]+)', self.gcode_text)
         if m:
             self.filament_weight_g = float(m.group(1))
-        m = re.search(r'; max_z_height\s*:\s*([\d.]+)', self.gcode_text)
+
+        # Filament cost
+        self.filament_cost = 0.0
+        m = re.search(r';\s*(?:total filament cost|filament cost)\s*[:=]\s*([\d.]+)', self.gcode_text)
+        if m:
+            self.filament_cost = float(m.group(1))
+
+        # Fallback to slice_info_plate if needed
+        if self.slice_info_plate is not None:
+            fil_elem = self.slice_info_plate.find('filament')
+            if fil_elem is not None:
+                if self.filament_length_mm == 0.0 and 'used_m' in fil_elem.attrib:
+                    try:
+                        self.filament_length_mm = float(fil_elem.attrib['used_m']) * 1000.0
+                    except ValueError:
+                        pass
+                if self.filament_weight_g == 0.0 and 'used_g' in fil_elem.attrib:
+                    try:
+                        self.filament_weight_g = float(fil_elem.attrib['used_g'])
+                    except ValueError:
+                        pass
+
+        if self.filament_length_mm <= 0.0 or self.filament_weight_g <= 0.0:
+            raise ValueError(f"{plate_id} Could not determine valid filament usage metrics. Refusing to merge.")
+
+        # Max Z Height
+        m = re.search(r';\s*(?:max_z_height|max_layer_z)\s*[:=]\s*([\d.]+)', self.gcode_text)
         if m:
             self.max_z_height = float(m.group(1))
+        else:
+            z_matches = re.findall(r';\s*Z_HEIGHT:\s*([\d.]+)', self.gcode_text)
+            if z_matches:
+                self.max_z_height = float(z_matches[-1])
 
-        m = re.search(r'; model printing time:\s*([^;]+);\s*total estimated time:\s*([^\n\r]+)', self.gcode_text)
+        if self.max_z_height <= 0.0:
+            raise ValueError(f"{plate_id} Could not determine valid max Z height. Refusing to merge.")
+
+        # Estimated & printing time
+        m = re.search(r';\s*model printing time:\s*([^;]+);\s*total estimated time:\s*([^\n\r]+)', self.gcode_text)
         if m:
             self.printing_time_s = parse_duration_str(m.group(1))
             self.estimated_time_s = parse_duration_str(m.group(2))
         elif self.slice_info_plate is not None:
             pred_meta = self.slice_info_plate.find("./metadata[@key='prediction']")
             if pred_meta is not None:
-                self.estimated_time_s = int(pred_meta.attrib.get('value', 0))
-                self.printing_time_s = int(self.estimated_time_s * 0.8)
+                try:
+                    self.estimated_time_s = int(pred_meta.attrib.get('value', 0))
+                    self.printing_time_s = int(self.estimated_time_s * 0.8)
+                except ValueError:
+                    pass
 
-        if self.estimated_time_s == 0:
-            self.estimated_time_s = max(60, self.layer_count * 15)
+        if self.estimated_time_s <= 0:
+            raise ValueError(f"{plate_id} Could not determine valid estimated printing time. Refusing to merge.")
 
         # Objects
         self.objects = []
@@ -255,45 +498,6 @@ class PlateInfo:
                     'name': obj.attrib.get('name', ''),
                     'skipped': obj.attrib.get('skipped', 'false')
                 })
-
-    def _parse_boundaries(self):
-        self.exec_start_idx = None
-        self.machine_start_end_idx = None
-        self.first_change_layer_idx = None
-        self.machine_end_start_idx = None
-        self.cali_test_idx = None
-
-        for i, line in enumerate(self.lines):
-            stripped = line.strip()
-            if stripped == '; EXECUTABLE_BLOCK_START':
-                self.exec_start_idx = i
-            elif stripped == '; MACHINE_START_GCODE_END':
-                self.machine_start_end_idx = i
-            elif stripped == '; CHANGE_LAYER' and self.first_change_layer_idx is None and self.machine_start_end_idx is not None:
-                self.first_change_layer_idx = i
-            elif stripped == '; MACHINE_END_GCODE_START':
-                self.machine_end_start_idx = i
-            elif self.exec_start_idx is not None and ';===== extrude cali test =====' in line and self.cali_test_idx is None:
-                self.cali_test_idx = i
-
-        # Fallbacks
-        if self.exec_start_idx is None:
-            self.exec_start_idx = 0
-        if self.machine_start_end_idx is None:
-            for i, line in enumerate(self.lines):
-                if line.strip() == '; CHANGE_LAYER':
-                    self.first_change_layer_idx = i
-                    self.machine_start_end_idx = max(0, i - 1)
-                    break
-        if self.first_change_layer_idx is None:
-            self.first_change_layer_idx = self.machine_start_end_idx + 1 if self.machine_start_end_idx else 0
-        if self.machine_end_start_idx is None:
-            for i in range(len(self.lines) - 1, -1, -1):
-                if 'M140 S0' in self.lines[i] or 'M18' in self.lines[i]:
-                    self.machine_end_start_idx = max(0, i - 10)
-                    break
-            if self.machine_end_start_idx is None:
-                self.machine_end_start_idx = len(self.lines) - 1
 
     def remap_object_id(self, old_id_str, new_id_str):
         """Remap an object ID in G-code, metadata, and pick_image to resolve collisions."""
@@ -306,19 +510,30 @@ class PlateInfo:
                 obj['identify_id'] = new_id_str
 
         # Update in G-code text and lines
-        pattern = re.compile(rf'(; OBJECT_ID:\s*){old_id}\b')
+        patterns = [
+            (re.compile(rf'(;\s*(?:start|stop)\s+printing object,\s*unique label id:\s*){old_id}\b'), rf'\g<1>{new_id}'),
+            (re.compile(rf'(;\s*OBJECT_ID:\s*){old_id}\b'), rf'\g<1>{new_id}'),
+            (re.compile(rf'(;\s*model label id:\s*.*?\b){old_id}\b'), rf'\g<1>{new_id}')
+        ]
         new_lines = []
         for line in self.lines:
-            new_lines.append(pattern.sub(rf'\g<1>{new_id}', line))
+            for pat, repl in patterns:
+                line = pat.sub(repl, line)
+            new_lines.append(line)
         self.lines = new_lines
         self.gcode_text = "\n".join(new_lines)
 
-        # Remap in pick_image if present
+        # Remap in pick_image if present (16-bit encoding: R + G * 256)
         if self.pick_image is not None and HAS_PIL:
+            old_r = old_id & 0xFF
+            old_g = (old_id >> 8) & 0xFF
+            new_r = new_id & 0xFF
+            new_g = (new_id >> 8) & 0xFF
             data = bytearray(self.pick_image.tobytes())
             for i in range(0, len(data), 4):
-                if data[i] == old_id and data[i+3] > 0:
-                    data[i] = new_id
+                if data[i] == old_r and data[i+1] == old_g and data[i+3] > 0:
+                    data[i] = new_r
+                    data[i+1] = new_g
             self.pick_image = Image.frombytes("RGBA", self.pick_image.size, bytes(data))
 
     def extract_priming_line(self):
@@ -327,68 +542,51 @@ class PlateInfo:
         stripping out pressure advance calibration instructions (M900 S/C/R)
         and dynamic flow calibration flag checks.
         """
+        fname = os.path.basename(self.source_file)
+        plate_id = f"[{fname} (Plate {self.plate_index})]"
+
+        if self.cali_test_idx is None:
+            raise ValueError(f"{plate_id} Missing extrude cali test section for priming line extraction. Refusing to merge.")
+
         prime_lines = []
-        if self.cali_test_idx is not None:
-            # 1. Backwards search for the initial position setup before cali test
-            # (e.g. G1 X108.000 Y-0.500 F30000, G1 Z0.300 F1200, M400, G2814 Z0.32)
-            pos_lines = []
-            for i in range(self.cali_test_idx - 1, max(self.exec_start_idx, self.cali_test_idx - 35), -1):
-                l = self.lines[i].strip()
-                if l.startswith('G1 X') or l.startswith('G0 X') or l.startswith('G1 Z') or l.startswith('G2814') or l.startswith('M400'):
-                    pos_lines.insert(0, self.lines[i])
-                    if 'Y-0.5' in l or 'Y0' in l or 'Y1' in l:
-                        break
 
-            # 2. Extract the actual prime line extrusion from cali test
-            cali_moves = []
-            in_flag_block = False
-            for i in range(self.cali_test_idx + 1, min(len(self.lines), self.cali_test_idx + 100)):
-                line = self.lines[i]
-                stripped = line.strip()
-                if '; MACHINE_START_GCODE_END' in stripped or ';========turn off light' in stripped:
+        # 1. Backwards search for the initial position setup before cali test
+        # (e.g. G1 X108.000 Y-0.500 F30000, G1 Z0.300 F1200, M400, G2814 Z0.32)
+        pos_lines = []
+        for i in range(self.cali_test_idx - 1, max(self.exec_start_idx, self.cali_test_idx - 35), -1):
+            l = self.lines[i].strip()
+            if l.startswith('G1 X') or l.startswith('G0 X') or l.startswith('G1 Z') or l.startswith('G2814') or l.startswith('M400'):
+                pos_lines.insert(0, self.lines[i])
+                if 'Y-0.5' in l or 'Y0' in l or 'Y1' in l:
                     break
-                if 'extrude_cali_flag' in stripped:
-                    in_flag_block = True
-                    continue
-                if in_flag_block:
-                    if 'M623' in stripped:
-                        in_flag_block = False
-                    continue
-                if stripped.startswith('M900'):
-                    continue
-                if stripped.startswith(';'):
-                    continue
-                if stripped:
-                    cali_moves.append(line)
 
-            prime_lines.extend(pos_lines)
-            prime_lines.extend(cali_moves)
+        # 2. Extract the actual prime line extrusion from cali test
+        cali_moves = []
+        in_flag_block = False
+        for i in range(self.cali_test_idx + 1, min(len(self.lines), self.cali_test_idx + 100)):
+            line = self.lines[i]
+            stripped = line.strip()
+            if '; MACHINE_START_GCODE_END' in stripped or 'turn off light' in stripped or stripped.startswith('; FEATURE:') or stripped == '; CHANGE_LAYER':
+                break
+            if 'extrude_cali_flag' in stripped:
+                in_flag_block = True
+                continue
+            if in_flag_block:
+                if 'M623' in stripped:
+                    in_flag_block = False
+                continue
+            if stripped.startswith('M900'):
+                continue
+            if stripped.startswith(';'):
+                continue
+            if stripped:
+                cali_moves.append(line)
 
-        # Fallback if no cali moves were extracted
+        prime_lines.extend(pos_lines)
+        prime_lines.extend(cali_moves)
+
         if not prime_lines:
-            prime_lines = [
-                "G90",
-                "G1 Z5 F1200",
-                "G1 X108.000 Y-0.500 F30000",
-                "G1 Z0.300 F1200",
-                "M400",
-                f"M104 S{self.nozzle_temp} ; ensure nozzle temp",
-                "G90",
-                "M83",
-                "G0 X128 E8 F720",
-                "G0 X133 E.3742 F1200",
-                "G0 X138 E.3742 F4800",
-                "G0 X143 E.3742 F1200",
-                "G0 X148 E.3742 F4800",
-                "G0 X153 E.3742 F1200",
-                "G91",
-                "G1 X1 Z-0.300",
-                "G1 X4",
-                "G1 Z1 F1200",
-                "G90",
-                "M400",
-                "G1 Z0.2"
-            ]
+            raise ValueError(f"{plate_id} Failed to extract priming line moves from extrude cali test section. Refusing to merge.")
 
         # Post-prime wiping & detector setup
         post_prime = []
@@ -465,6 +663,7 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
     total_filament_mm = sum(p.filament_length_mm for p in plates)
     total_filament_cm3 = sum(p.filament_volume_cm3 for p in plates)
     total_filament_g = sum(p.filament_weight_g for p in plates)
+    total_filament_cost = sum(p.filament_cost for p in plates)
     max_z = max(p.max_z_height for p in plates)
 
     merged_lines = []
@@ -589,9 +788,11 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
     last_plate = plates[-1]
     merged_lines.extend(last_plate.lines[last_plate.machine_end_start_idx:])
 
-    # 4. UPDATE HEADER BLOCK AT THE TOP
+    # 4. UPDATE HEADER BLOCK AT THE TOP AND TAIL FILAMENT METRICS
     updated_lines = []
     in_header = False
+    header_updated_keys = set()
+    after_exec_block_end = False
 
     all_obj_labels = []
     for p in plates:
@@ -600,11 +801,20 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
                 all_obj_labels.append(obj['identify_id'])
 
     for line in merged_lines:
-        if line.strip() == '; HEADER_BLOCK_START':
+        stripped = line.strip()
+
+        if stripped == '; HEADER_BLOCK_START':
             in_header = True
             updated_lines.append(line)
             continue
-        if line.strip() == '; HEADER_BLOCK_END':
+        if stripped == '; HEADER_BLOCK_END':
+            # Ensure BambuStudio-style filament lines exist in header
+            if '; total filament length [mm] :' not in header_updated_keys:
+                updated_lines.append(f"; total filament length [mm] : {total_filament_mm:.2f}")
+            if '; total filament volume [cm^3] :' not in header_updated_keys:
+                updated_lines.append(f"; total filament volume [cm^3] : {total_filament_cm3:.2f}")
+            if '; total filament weight [g] :' not in header_updated_keys:
+                updated_lines.append(f"; total filament weight [g] : {total_filament_g:.2f}")
             in_header = False
             updated_lines.append(line)
             continue
@@ -612,25 +822,58 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
         if in_header:
             if line.startswith('; total layer number:'):
                 updated_lines.append(f"; total layer number: {total_layers}")
+                header_updated_keys.add('; total layer number:')
                 continue
             if line.startswith('; model printing time:'):
                 updated_lines.append(f"; model printing time: {format_duration(total_printing_s)}; total estimated time: {format_duration(total_estimated_s)}")
+                header_updated_keys.add('; model printing time:')
                 continue
             if line.startswith('; total filament length [mm] :'):
                 updated_lines.append(f"; total filament length [mm] : {total_filament_mm:.2f}")
+                header_updated_keys.add('; total filament length [mm] :')
                 continue
             if line.startswith('; total filament volume [cm^3] :'):
                 updated_lines.append(f"; total filament volume [cm^3] : {total_filament_cm3:.2f}")
+                header_updated_keys.add('; total filament volume [cm^3] :')
                 continue
             if line.startswith('; total filament weight [g] :'):
                 updated_lines.append(f"; total filament weight [g] : {total_filament_g:.2f}")
+                header_updated_keys.add('; total filament weight [g] :')
                 continue
             if line.startswith('; max_z_height:'):
                 updated_lines.append(f"; max_z_height: {max_z:.2f}")
+                header_updated_keys.add('; max_z_height:')
                 continue
             if line.startswith('; model label id:'):
                 if all_obj_labels:
                     updated_lines.append(f"; model label id: {','.join(all_obj_labels)}")
+                header_updated_keys.add('; model label id:')
+                continue
+
+        if stripped == '; EXECUTABLE_BLOCK_END':
+            after_exec_block_end = True
+            updated_lines.append(line)
+            continue
+
+        if after_exec_block_end:
+            # Update OrcaSlicer tail filament metrics
+            if line.startswith('; filament used [mm] ='):
+                updated_lines.append(f"; filament used [mm] = {total_filament_mm:.2f}")
+                continue
+            if line.startswith('; filament used [cm3] =') or line.startswith('; filament used [cm^3] ='):
+                updated_lines.append(f"; filament used [cm3] = {total_filament_cm3:.2f}")
+                continue
+            if line.startswith('; filament used [g] ='):
+                updated_lines.append(f"; filament used [g] = {total_filament_g:.2f}")
+                continue
+            if line.startswith('; total filament used [g] ='):
+                updated_lines.append(f"; total filament used [g] = {total_filament_g:.2f}")
+                continue
+            if line.startswith('; filament cost ='):
+                updated_lines.append(f"; filament cost = {total_filament_cost:.2f}")
+                continue
+            if line.startswith('; total filament cost ='):
+                updated_lines.append(f"; total filament cost = {total_filament_cost:.2f}")
                 continue
 
         updated_lines.append(line)
@@ -707,7 +950,6 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
 
     all_plates = []
     base_zip_path = input_files[0]
-    used_object_ids = set()
 
     for fpath in input_files:
         with zipfile.ZipFile(fpath, 'r') as z:
@@ -717,28 +959,34 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
             if not plate_gcode_names:
                 plate_gcode_names = [n for n in names if n.endswith('.gcode')]
 
+            if not plate_gcode_names:
+                raise RuntimeError(f"No G-code plate files found in 3MF archive: {os.path.basename(fpath)}")
+
             plate_gcode_names.sort(key=natural_sort_key)
 
             slice_info_root = None
             if 'Metadata/slice_info.config' in names:
                 try:
                     slice_info_root = ET.fromstring(z.read('Metadata/slice_info.config').decode('utf-8'))
-                except Exception:
-                    pass
+                except Exception as e:
+                    raise RuntimeError(f"Failed to parse Metadata/slice_info.config in {os.path.basename(fpath)}: {e}")
 
             for gcode_name in plate_gcode_names:
                 m = re.search(r'plate_(\d+)', gcode_name)
                 plate_idx = int(m.group(1)) if m else 1
 
-                gcode_text = z.read(gcode_name).decode('utf-8', errors='ignore')
+                try:
+                    gcode_text = z.read(gcode_name).decode('utf-8')
+                except UnicodeDecodeError:
+                    gcode_text = z.read(gcode_name).decode('utf-8', errors='replace')
 
                 json_name = f"Metadata/plate_{plate_idx}.json"
                 json_data = {}
                 if json_name in names:
                     try:
                         json_data = json.loads(z.read(json_name).decode('utf-8'))
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to parse {json_name} in {os.path.basename(fpath)}: {e}")
 
                 plate_elem = None
                 if slice_info_root is not None:
@@ -790,29 +1038,37 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
                     small_img=small_img
                 )
 
-                # Check and resolve any object identify_id collisions
-                for obj in pinfo.objects:
-                    orig_id = obj['identify_id']
-                    if orig_id:
-                        if orig_id in used_object_ids:
-                            # Find next unused integer ID between 100 and 250
-                            new_int = 100
-                            while str(new_int) in used_object_ids:
-                                new_int += 1
-                            new_id_str = str(new_int)
-                            if verbose:
-                                print(f"    [!] Remapping conflicting object ID '{orig_id}' -> '{new_id_str}' for '{obj['name']}' in {os.path.basename(fpath)} [P{plate_idx}]")
-                            pinfo.remap_object_id(orig_id, new_id_str)
-                            used_object_ids.add(new_id_str)
-                        else:
-                            used_object_ids.add(orig_id)
-
                 all_plates.append(pinfo)
                 if verbose:
                     print(f"    -> Loaded {os.path.basename(fpath)} [Plate {plate_idx}]: {pinfo.layer_count} layers, ~{format_duration(pinfo.estimated_time_s)}, bed={pinfo.bed_temp}C, nozzle={pinfo.nozzle_temp}C")
 
     if not all_plates:
         raise RuntimeError("No plates or G-code found in provided 3MF files.")
+
+    # Check and resolve any object identify_id collisions across all plates
+    all_existing_ids = set()
+    for p in all_plates:
+        for obj in p.objects:
+            oid = obj.get('identify_id', '')
+            if oid.isdigit():
+                all_existing_ids.add(int(oid))
+
+    next_free_id = max(all_existing_ids, default=100) + 1
+    used_object_ids = set()
+
+    for p in all_plates:
+        for obj in list(p.objects):
+            orig_id = obj.get('identify_id', '')
+            if orig_id:
+                if orig_id in used_object_ids:
+                    new_id_str = str(next_free_id)
+                    next_free_id += 1
+                    if verbose:
+                        print(f"    [!] Remapping conflicting object ID '{orig_id}' -> '{new_id_str}' for '{obj['name']}' in {os.path.basename(p.source_file)} [P{p.plate_index}]")
+                    p.remap_object_id(orig_id, new_id_str)
+                    used_object_ids.add(new_id_str)
+                else:
+                    used_object_ids.add(orig_id)
 
     # Print the scheduled pause timetable
     if verbose:
@@ -892,6 +1148,8 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
         try:
             root = ET.fromstring(base_files['Metadata/slice_info.config'].decode('utf-8'))
             plate_elem = root.find('plate')
+            if plate_elem is None:
+                raise RuntimeError("Metadata/slice_info.config missing required <plate> tag.")
             if plate_elem is not None:
                 for meta in plate_elem.findall('metadata'):
                     k = meta.attrib.get('key')
@@ -935,8 +1193,7 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
                 ET.indent(root, space="  ")
             base_files['Metadata/slice_info.config'] = ET.tostring(root, encoding='utf-8', xml_declaration=True)
         except Exception as e:
-            if verbose:
-                print(f"[!] Warning: slice_info.config update: {e}")
+            raise RuntimeError(f"Failed to update Metadata/slice_info.config: {e}")
 
     # Update Metadata/plate_1.json
     all_bbox_objects = []
@@ -971,8 +1228,8 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
             if hasattr(ET, 'indent'):
                 ET.indent(m_root, space="  ")
             base_files['Metadata/model_settings.config'] = ET.tostring(m_root, encoding='utf-8', xml_declaration=True)
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to update Metadata/model_settings.config: {e}")
 
     # Update cut_information.xml
     if 'Metadata/cut_information.xml' in base_files:
@@ -988,8 +1245,8 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
             if hasattr(ET, 'indent'):
                 ET.indent(c_root, space=" ")
             base_files['Metadata/cut_information.xml'] = ET.tostring(c_root, encoding='utf-8', xml_declaration=True)
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Failed to update Metadata/cut_information.xml: {e}")
 
     # Clean up any extra plate files from multi-plate base files
     keys_to_delete = [k for k in base_files if re.match(r'^Metadata/plate_\d+\.gcode.*$', k) and not k.startswith('Metadata/plate_1.gcode')]
@@ -1077,9 +1334,12 @@ def main():
             verbose=not args.quiet
         )
     except Exception as e:
-        print(f"[!] Error merging files: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n[!] ERROR: Merging aborted: {e}", file=sys.stderr)
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
         sys.exit(1)
 
 
