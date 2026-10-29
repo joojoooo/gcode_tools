@@ -228,6 +228,20 @@ class PlateInfo:
         if self.machine_start_end_idx is None:
             self.machine_start_end_idx = self.first_change_layer_idx
 
+        # Locate filament start gcode index
+        self.filament_start_idx = None
+        for i in range(self.exec_start_idx + 1, self.first_change_layer_idx):
+            stripped = self.lines[i].strip()
+            if stripped == '; filament start gcode' or stripped.startswith('; filament start') or stripped == '; FILAMENT_START_GCODE':
+                self.filament_start_idx = i
+                break
+
+        if self.filament_start_idx is None:
+            for i in range(self.first_change_layer_idx - 1, max(self.exec_start_idx, self.first_change_layer_idx - 15), -1):
+                stripped = self.lines[i].strip()
+                if stripped.startswith('M900 K') or stripped.startswith('M981') or stripped.startswith('M106 S0'):
+                    self.filament_start_idx = i
+
         # Validate that machine start gcode is present between exec_start_idx and first_change_layer_idx
         if self.machine_start_idx is None or self.machine_start_idx >= self.first_change_layer_idx:
             raise ValueError(f"{plate_id} Machine start G-code entry point not found between '; EXECUTABLE_BLOCK_START' and '; CHANGE_LAYER'. Refusing to merge.")
@@ -601,11 +615,42 @@ class PlateInfo:
             "T1000",
             "M211 X0 Y0 Z0 ; turn off soft endstops",
             "M1007 S1 ; turn on mass estimation",
-            "G29.4",
-            "M981 S1 P20000 ; open spaghetti detector"
+            "G29.4"
         ])
 
         return prime_lines + post_prime
+
+    def extract_filament_start_gcode(self):
+        """
+        Extracts the filament start G-code block (between '; filament start gcode'
+        and '; CHANGE_LAYER'), preserving filament-specific pressure advance
+        (M900 K...), chamber/aux fan settings, spaghetti detector activation,
+        and layer 1 part fan setup (M106 S0).
+        """
+        lines = []
+        if self.filament_start_idx is not None and self.filament_start_idx < self.first_change_layer_idx:
+            for i in range(self.filament_start_idx, self.first_change_layer_idx):
+                line = self.lines[i]
+                stripped = line.strip()
+                if stripped and not stripped.startswith('; CHANGE_LAYER'):
+                    lines.append(line)
+
+        # Fallback / safety check: ensure essential safety & detection commands are present
+        has_spaghetti = any('M981' in l for l in lines)
+        has_fan_off = any(re.match(r'^M106\s+(?:P0\s+)?S0\b', l.strip()) for l in lines)
+
+        res = []
+        if not lines:
+            res.append("; filament start gcode")
+        else:
+            res.extend(lines)
+
+        if not has_spaghetti:
+            res.append("M981 S1 P20000 ; open spaghetti detector")
+        if not has_fan_off:
+            res.append("M106 S0 ; turn off part cooling fan for layer 1")
+
+        return res
 
 
 def make_preview_collage(images, canvas_size=(512, 512)):
@@ -736,6 +781,11 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
             # Add priming line
             prime_code = plate.extract_priming_line()
             merged_lines.extend(prime_code)
+
+            # Add filament start G-code (M900 K..., fan setup, spaghetti detector)
+            fil_start_code = plate.extract_filament_start_gcode()
+            merged_lines.extend(fil_start_code)
+
             merged_lines.append("; ==================== BEGIN PRINTING PLATE OBJECTS =================")
             merged_lines.append("")
 
