@@ -33,8 +33,8 @@ exit /b 1
 echo Working directory: %~dp0
 echo.
 
-:: Execute the merge script
-"%PY_CMD%" merge_3mf.py
+:: Execute the merge script with mech mode fast check disabled by default
+"%PY_CMD%" merge_3mf.py --no-mech-mode %*
 
 echo.
 echo ========================================================

@@ -694,10 +694,11 @@ def make_preview_collage(images, canvas_size=(512, 512)):
     return collage
 
 
-def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
+def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0, no_mech_mode=False):
     """
     Combines G-code from multiple PlateInfo objects into a single G-code string.
     Recalculates layer numbers, totals, progress (M73 P/R), and updates headers.
+    Optionally deletes 'mech mode fast check' calibration G-code if no_mech_mode is True.
     """
     if not plates:
         raise ValueError("No plates provided to merge.")
@@ -718,7 +719,22 @@ def merge_plates(plates, pause_gcode="M400 U1", z_lift=0.0):
     plate1 = plates[0]
     p1_duration_s = max(1, plate1.estimated_time_s)
 
-    for line in plate1.lines[:plate1.first_change_layer_idx]:
+    in_mech_mode = False
+    mech_mode_start_re = re.compile(r';\s*={0,}\s*mech mode fast check start\b', re.IGNORECASE)
+    mech_mode_end_re = re.compile(r';\s*={0,}\s*mech mode fast check end\b', re.IGNORECASE)
+
+    for idx, line in enumerate(plate1.lines[:plate1.first_change_layer_idx]):
+        if no_mech_mode and idx >= plate1.exec_start_idx:
+            if mech_mode_start_re.search(line):
+                in_mech_mode = True
+                merged_lines.append(line)
+                continue
+            if in_mech_mode:
+                if mech_mode_end_re.search(line):
+                    in_mech_mode = False
+                    merged_lines.append(line)
+                continue
+
         m = re.match(r'^M73\s+P(\d+)\s+R(\d+)(.*)$', line)
         if m:
             orig_r = int(m.group(2))
@@ -987,7 +1003,7 @@ def print_pause_schedule(plates):
     print("=" * 68 + "\n")
 
 
-def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0, verbose=True):
+def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0, no_mech_mode=False, verbose=True):
     """
     Main merging function.
     Reads input .gcode.3mf files, parses all plates, merges G-code, images,
@@ -1125,7 +1141,7 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
         print_pause_schedule(all_plates)
         print(f"[*] Merging {len(all_plates)} plate(s) into single G-code...")
 
-    merged_gcode = merge_plates(all_plates, pause_gcode=pause_gcode, z_lift=z_lift)
+    merged_gcode = merge_plates(all_plates, pause_gcode=pause_gcode, z_lift=z_lift, no_mech_mode=no_mech_mode)
     merged_gcode_bytes = merged_gcode.encode('utf-8')
     merged_md5 = hashlib.md5(merged_gcode_bytes).hexdigest().upper()
 
@@ -1140,6 +1156,8 @@ def merge_3mf_files(input_files, output_path, pause_gcode="M400 U1", z_lift=0.0,
         print(f"    - Estimated Time: {format_duration(total_estimated_s)}")
         print(f"    - Filament: {total_filament_m:.2f} m ({total_weight_g:.2f} g)")
         print(f"    - Plate Pauses: {len(all_plates) - 1}")
+        if no_mech_mode:
+            print(f"    - Mech Mode Fast Check: Skipped")
         print(f"    - MD5 Checksum: {merged_md5}")
 
     with zipfile.ZipFile(base_zip_path, 'r') as z_base:
@@ -1347,6 +1365,12 @@ def main():
         help="Optional extra manual Z-lift distance in mm before pause (defaults to 0.0 mm; M400 U1 natively handles Z-hop and parking)."
     )
     parser.add_argument(
+        "--no-mech-mode", "--skip-mech-mode", "--disable-mech-mode",
+        dest="no_mech_mode",
+        action="store_true",
+        help="Delete 'mech mode fast check' calibration G-code (vibration sweep) from machine start G-code."
+    )
+    parser.add_argument(
         "-q", "--quiet",
         action="store_true",
         help="Suppress informational output."
@@ -1381,6 +1405,7 @@ def main():
             output_path=output_path,
             pause_gcode=args.pause_gcode,
             z_lift=args.z_lift,
+            no_mech_mode=args.no_mech_mode,
             verbose=not args.quiet
         )
     except Exception as e:
